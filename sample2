@@ -1,0 +1,208 @@
+Below are the rerunnable Data Definition Language (DDL) scripts for creating the `api_logs`, `request_bodies`, `response_bodies`, and `users` tables in Oracle, as used in the `api_tracker` package. These scripts are designed to be **rerunnable**, meaning they can be executed multiple times without causing errors (e.g., by dropping objects before creating them). Each script includes sequences, tables, constraints, and comments for clarity.
+
+---
+
+### Complete Rerunnable DDL Script
+
+```sql
+-- Drop sequences if they exist to ensure a clean slate
+BEGIN
+   EXECUTE IMMEDIATE 'DROP SEQUENCE api_log_id_seq';
+EXCEPTION
+   WHEN OTHERS THEN
+      IF SQLCODE != -2289 THEN RAISE; END IF; -- Ignore "sequence does not exist" error
+END;
+/
+
+BEGIN
+   EXECUTE IMMEDIATE 'DROP SEQUENCE request_body_id_seq';
+EXCEPTION
+   WHEN OTHERS THEN
+      IF SQLCODE != -2289 THEN RAISE; END IF;
+END;
+/
+
+BEGIN
+   EXECUTE IMMEDIATE 'DROP SEQUENCE response_body_id_seq';
+EXCEPTION
+   WHEN OTHERS THEN
+      IF SQLCODE != -2289 THEN RAISE; END IF;
+END;
+/
+
+BEGIN
+   EXECUTE IMMEDIATE 'DROP SEQUENCE user_id_seq';
+EXCEPTION
+   WHEN OTHERS THEN
+      IF SQLCODE != -2289 THEN RAISE; END IF;
+END;
+/
+
+-- Drop tables if they exist, in reverse dependency order to avoid constraint violations
+BEGIN
+   EXECUTE IMMEDIATE 'DROP TABLE request_bodies CASCADE CONSTRAINTS';
+EXCEPTION
+   WHEN OTHERS THEN
+      IF SQLCODE != -942 THEN RAISE; END IF; -- Ignore "table does not exist" error
+END;
+/
+
+BEGIN
+   EXECUTE IMMEDIATE 'DROP TABLE response_bodies CASCADE CONSTRAINTS';
+EXCEPTION
+   WHEN OTHERS THEN
+      IF SQLCODE != -942 THEN RAISE; END IF;
+END;
+/
+
+BEGIN
+   EXECUTE IMMEDIATE 'DROP TABLE api_logs CASCADE CONSTRAINTS';
+EXCEPTION
+   WHEN OTHERS THEN
+      IF SQLCODE != -942 THEN RAISE; END IF;
+END;
+/
+
+BEGIN
+   EXECUTE IMMEDIATE 'DROP TABLE users CASCADE CONSTRAINTS';
+EXCEPTION
+   WHEN OTHERS THEN
+      IF SQLCODE != -942 THEN RAISE; END IF;
+END;
+/
+
+-- Create sequences
+CREATE SEQUENCE api_log_id_seq
+   START WITH 1
+   INCREMENT BY 1
+   NOCACHE
+   NOCYCLE;
+
+CREATE SEQUENCE request_body_id_seq
+   START WITH 1
+   INCREMENT BY 1
+   NOCACHE
+   NOCYCLE;
+
+CREATE SEQUENCE response_body_id_seq
+   START WITH 1
+   INCREMENT BY 1
+   NOCACHE
+   NOCYCLE;
+
+CREATE SEQUENCE user_id_seq
+   START WITH 1
+   INCREMENT BY 1
+   NOCACHE
+   NOCYCLE;
+
+-- Create tables with comments
+CREATE TABLE users (
+   id NUMBER(19,0) DEFAULT user_id_seq.NEXTVAL,
+   username VARCHAR2(50) NOT NULL,
+   CONSTRAINT pk_users PRIMARY KEY (id)
+);
+
+COMMENT ON TABLE users IS 'Stores authenticated user information for linking to API logs.';
+COMMENT ON COLUMN users.id IS 'Unique identifier for each user, auto-incremented.';
+COMMENT ON COLUMN users.username IS 'Username of the authenticated user, required.';
+
+CREATE TABLE api_logs (
+   id NUMBER(19,0) DEFAULT api_log_id_seq.NEXTVAL,
+   request_method VARCHAR2(10) NOT NULL,
+   request_url VARCHAR2(255) NOT NULL,
+   request_headers CLOB,
+   response_status NUMBER(10,0),
+   response_headers CLOB,
+   client_ip VARCHAR2(45) NOT NULL,
+   request_time DATE DEFAULT SYSDATE NOT NULL,
+   response_time DATE,
+   execution_time_ms NUMBER(10,0),
+   user_id NUMBER(19,0),
+   error_message CLOB,
+   CONSTRAINT pk_api_logs PRIMARY KEY (id),
+   CONSTRAINT fk_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
+);
+
+COMMENT ON TABLE api_logs IS 'Stores metadata for API requests and responses.';
+COMMENT ON COLUMN api_logs.id IS 'Unique identifier for each log entry, auto-incremented.';
+COMMENT ON COLUMN api_logs.request_method IS 'HTTP method (e.g., GET, POST), required.';
+COMMENT ON COLUMN api_logs.request_url IS 'API endpoint URL (e.g., /api/users), required.';
+COMMENT ON COLUMN api_logs.request_headers IS 'JSON string of request headers, optional.';
+COMMENT ON COLUMN api_logs.response_status IS 'HTTP status code (e.g., 200, 404), set after response.';
+COMMENT ON COLUMN api_logs.response_headers IS 'JSON string of response headers, set after response.';
+COMMENT ON COLUMN api_logs.client_ip IS 'Client IP address (IPv4/IPv6), required.';
+COMMENT ON COLUMN api_logs.request_time IS 'Timestamp of request receipt, defaults to current time.';
+COMMENT ON COLUMN api_logs.response_time IS 'Timestamp of response sent, null until response.';
+COMMENT ON COLUMN api_logs.execution_time_ms IS 'Processing time in milliseconds, set after response.';
+COMMENT ON COLUMN api_logs.user_id IS 'Foreign key to users table, null if unauthenticated.';
+COMMENT ON COLUMN api_logs.error_message IS 'Error details if request failed, optional.';
+
+CREATE TABLE request_bodies (
+   id NUMBER(19,0) DEFAULT request_body_id_seq.NEXTVAL,
+   api_log_id NUMBER(19,0) NOT NULL,
+   body CLOB,
+   CONSTRAINT pk_request_bodies PRIMARY KEY (id),
+   CONSTRAINT fk_api_log_request FOREIGN KEY (api_log_id) REFERENCES api_logs(id) ON DELETE CASCADE
+);
+
+COMMENT ON TABLE request_bodies IS 'Stores request payloads linked to api_logs.';
+COMMENT ON COLUMN request_bodies.id IS 'Unique identifier for each request body, auto-incremented.';
+COMMENT ON COLUMN request_bodies.api_log_id IS 'Foreign key linking to api_logs, required.';
+COMMENT ON COLUMN request_bodies.body IS 'Request payload (e.g., JSON), optional.';
+
+CREATE TABLE response_bodies (
+   id NUMBER(19,0) DEFAULT response_body_id_seq.NEXTVAL,
+   api_log_id NUMBER(19,0) NOT NULL,
+   body CLOB,
+   CONSTRAINT pk_response_bodies PRIMARY KEY (id),
+   CONSTRAINT fk_api_log_response FOREIGN KEY (api_log_id) REFERENCES api_logs(id) ON DELETE CASCADE
+);
+
+COMMENT ON TABLE response_bodies IS 'Stores response payloads linked to api_logs.';
+COMMENT ON COLUMN response_bodies.id IS 'Unique identifier for each response body, auto-incremented.';
+COMMENT ON COLUMN response_bodies.api_log_id IS 'Foreign key linking to api_logs, required.';
+COMMENT ON COLUMN response_bodies.body IS 'Response payload (e.g., JSON), optional.';
+```
+
+---
+
+### Explanation of Rerunnability
+1. **Drop Statements**:
+   - Each `DROP` command is wrapped in a `BEGIN...EXCEPTION` block to catch errors like "object does not exist" (`SQLCODE -2289` for sequences, `-942` for tables).
+   - `CASCADE CONSTRAINTS` ensures foreign keys are dropped with tables, avoiding dependency errors.
+   - Order matters: Drop `request_bodies` and `response_bodies` before `api_logs` (due to foreign keys), and `api_logs` before `users`.
+
+2. **Sequence Creation**:
+   - `NOCACHE` and `NOCYCLE` ensure predictable, sequential IDs without gaps or wrapping, suitable for logging.
+   - Recreated each time to reset the sequence starting at 1 (adjust `START WITH` if you need to preserve existing values).
+
+3. **Table Creation**:
+   - Primary keys use `CONSTRAINT` clauses for clarity and consistency.
+   - Foreign keys include `ON DELETE` actions (`SET NULL` for `user_id`, `CASCADE` for `api_log_id`) to define behavior when parent rows are deleted.
+   - Comments enhance readability and documentation, making the schema self-explanatory.
+
+---
+
+### Execution Instructions
+1. **Run in Oracle**:
+   - Copy the entire script into an SQL client (e.g., SQL*Plus, SQL Developer).
+   - Execute as a single script or split into sections (ensure drops run before creates).
+   - Use `/` after each block to execute in SQL*Plus.
+
+2. **Verify**:
+   - Check sequences: `SELECT sequence_name FROM user_sequences;`
+   - Check tables: `SELECT table_name FROM user_tables;`
+   - Check constraints: `SELECT constraint_name, table_name FROM user_constraints;`
+
+3. **Rerun**:
+   - Run the script again to drop and recreate all objects cleanly.
+
+---
+
+### Notes
+- **Data Loss**: Rerunning drops all existing data. For production, modify the script to avoid drops or use `CREATE OR REPLACE` where applicable (not possible for tables directly).
+- **Indexes**: No additional indexes are created here; consider adding indexes on `api_logs.request_url` or `api_logs.request_time` for performance if needed.
+- **Permissions**: Ensure the user executing this has privileges to create sequences and tables (`CREATE SEQUENCE`, `CREATE TABLE`).
+
+This script aligns with the `api_tracker` package’s design and can be rerun safely to reset the schema. Let me know if you need modifications (e.g., preserving data, adding indexes)!
