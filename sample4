@@ -1,0 +1,563 @@
+To enhance the api_tracker package by:
+	1	Sanitizing request and response headers (in addition to bodies),
+	2	Handling exceptions during logging to ensure request processing continues even if logging fails,
+I’ll update the relevant components of the package. This includes modifying the sanitization logic, adjusting the middleware to handle logging exceptions gracefully, and updating the DDL and related code to reflect these changes. Below is the complete updated implementation.
+
+Key Changes
+	1	Sanitization:
+	◦	Extend sanitize_data to sanitize request_headers and response_headers by masking sensitive fields (e.g., Authorization, X-API-Key) defined in SENSITIVE_FIELDS.
+	◦	Apply sanitization consistently across all logged data.
+	2	Exception Handling:
+	◦	Wrap logging calls (log_request and log_response) in try-except blocks to catch and log exceptions (e.g., database errors, file I/O issues).
+	◦	Continue processing the request/response even if logging fails, ensuring the API remains operational.
+	3	Schema:
+	◦	No changes to the DDL are required for these features, as they affect application logic rather than table structure. The updated DDL includes the previously requested request_id, correlation_id, and track_id.
+
+Updated Code
+1. `api_tracker/sanitizer.py`
+Extend sanitization to handle headers alongside bodies.
+import json
+from typing import Optional
+from .config import settings
+
+def sanitize_data(data: Optional[str]) -> Optional[str]:
+    if not data:
+        return None
+    try:
+        payload = json.loads(data)
+        if isinstance(payload, dict):
+            for field in settings.SENSITIVE_FIELDS:
+                # Case-insensitive matching for headers
+                for key in list(payload.keys()):
+                    if field.lower() == key.lower():
+                        payload[key] = "****"
+            return json.dumps(payload)
+        elif isinstance(payload, list):
+            for item in payload:
+                if isinstance(item, dict):
+                    for field in settings.SENSITIVE_FIELDS:
+                        for key in list(item.keys()):
+                            if field.lower() == key.lower():
+                                item[key] = "****"
+            return json.dumps(payload)
+        return data
+    except json.JSONDecodeError:
+        return data
+Changes:
+	•	Added case-insensitive matching for header keys (e.g., Authorization vs. authorization).
+	•	Applies to both request_headers, response_headers, and bodies.
+2. `api_tracker/main.py`
+Update the middleware to sanitize headers and handle logging exceptions.
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
+from sqlalchemy.orm import Session
+from .database import get_db
+from .config import settings
+from .sanitizer import sanitize_data
+from .logging_strategies import LoggingContext
+import time
+import json
+from datetime import datetime, timezone
+import uuid
+import logging
+
+# Configure basic logging for exceptions
+logging.basicConfig(level=logging.ERROR)
+logger = logging.getLogger(__name__)
+
+def add_api_logging_middleware(app: FastAPI):
+    @app.middleware("http")
+    async def log_api_requests(request: Request, call_next):
+        request_path = str(request.url.path)
+        if request_path in settings.EXCLUDED_PATHS:
+            return await call_next(request)
+
+        start_time = time.time()
+        db = next(get_db())
+        logging_context = LoggingContext(db)
+
+        # Generate request_id and extract correlation_id, track_id from headers
+        request_id = uuid.uuid4()
+        correlation_id = request.headers.get("X-Correlation-ID")
+        track_id = request.headers.get("X-Track-ID")
+
+        # Capture and sanitize request details
+        request_headers = sanitize_data(json.dumps(dict(request.headers)))
+        request_body = await request.body()
+        request_body_str = sanitize_data(request_body.decode("utf-8", errors="ignore") if request_body else None)
+        client_ip = request.client.host
+
+        # Prepare log data
+        log_data = {
+            "request_id": str(request_id),
+            "correlation_id": correlation_id,
+            "track_id": track_id,
+            "request_method": request.method,
+            "request_url": request_path,
+            "request_headers": request_headers,
+            "request_body": request_body_str,
+            "client_ip": client_ip,
+            "request_time": datetime.now(timezone.utc),
+        }
+
+        # Log request with exception handling
+        log_ids = []
+        try:
+            log_ids = logging_context.log_request(log_data)
+        except Exception as e:
+            logger.error(f"Failed to log request for {request_path}: {str(e)}", exc_info=True)
+
+        # Process the request
+        try:
+            response = await call_next(request)
+            response_body = b""
+            async for chunk in response.body_iterator:
+                response_body += chunk
+            response_body_str = sanitize_data(response_body.decode("utf-8", errors="ignore") if response_body else None)
+
+            # Sanitize response headers
+            response_headers = sanitize_data(json.dumps(dict(response.headers)))
+
+            # Update log with response details
+            execution_time_ms = int((time.time() - start_time) * 1000)
+            response_data = {
+                "response_status": response.status_code,
+                "response_body": response_body_str,
+                "response_headers": response_headers,
+                "response_time": datetime.now(timezone.utc),
+                "execution_time_ms": execution_time_ms,
+            }
+
+            # Log response with exception handling
+            try:
+                if log_ids:  # Only log if request logging succeeded
+                    logging_context.log_response(log_ids, response_data)
+            except Exception as e:
+                logger.error(f"Failed to log response for {request_path}: {str(e)}", exc_info=True)
+
+            # Add request_id to response headers
+            response_headers_dict = json.loads(response_headers) if response_headers else {}
+            response_headers_dict["X-Request-ID"] = str(request_id)
+            return JSONResponse(
+                status_code=response.status_code,
+                content=json.loads(response_body_str) if response_body_str else None,
+                headers=response_headers_dict,
+            )
+
+        except Exception as e:
+            execution_time_ms = int((time.time() - start_time) * 1000)
+            response_data = {
+                "response_status": 500,
+                "error_message": str(e),
+                "response_time": datetime.now(timezone.utc),
+                "execution_time_ms": execution_time_ms,
+            }
+
+            # Log error with exception handling
+            try:
+                if log_ids:
+                    logging_context.log_response(log_ids, response_data)
+            except Exception as e_log:
+                logger.error(f"Failed to log error for {request_path}: {str(e_log)}", exc_info=True)
+
+            raise HTTPException(status_code=500, detail="Internal Server Error")
+Changes:
+	•	Added request_id generation using uuid.uuid4() and extraction of correlation_id/track_id from headers.
+	•	Sanitized request_headers and response_headers using sanitize_data.
+	•	Wrapped log_request and log_response in try-except blocks, logging errors to logging.error without interrupting the request flow.
+	•	Added X-Request-ID to response headers for traceability.
+3. `api_tracker/models.py`
+Update APILog to include the new columns.
+from sqlalchemy import Column, Integer, String, Text, DateTime, BigInteger, ForeignKey, Sequence, BINARY
+from sqlalchemy.sql import func
+from .database import Base
+
+api_log_seq = Sequence('api_log_id_seq')
+request_body_seq = Sequence('request_body_id_seq')
+response_body_seq = Sequence('response_body_id_seq')
+user_seq = Sequence('user_id_seq')
+
+class APILog(Base):
+    __tablename__ = "api_logs"
+
+    id = Column(BigInteger, api_log_seq, primary_key=True, server_default=api_log_seq.next_value())
+    request_id = Column(BINARY(16), nullable=False, unique=True)  # RAW(16) for UUID
+    correlation_id = Column(String(36), nullable=True)  # VARCHAR2(36) for UUID
+    track_id = Column(String(50), nullable=True)  # VARCHAR2(50) for custom ID
+    request_method = Column(String(10), nullable=False)
+    request_url = Column(String(255), nullable=False)
+    request_headers = Column(Text, nullable=True)
+    response_status = Column(Integer, nullable=True)
+    response_headers = Column(Text, nullable=True)
+    client_ip = Column(String(45), nullable=False)
+    request_time = Column(DateTime, nullable=False, server_default=func.sysdate())
+    response_time = Column(DateTime, nullable=True)
+    execution_time_ms = Column(Integer, nullable=True)
+    user_id = Column(BigInteger, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    error_message = Column(Text, nullable=True)
+
+class RequestBody(Base):
+    __tablename__ = "request_bodies"
+
+    id = Column(BigInteger, request_body_seq, primary_key=True, server_default=request_body_seq.next_value())
+    api_log_id = Column(BigInteger, ForeignKey("api_logs.id", ondelete="CASCADE"), nullable=False)
+    body = Column(Text, nullable=True)
+
+class ResponseBody(Base):
+    __tablename__ = "response_bodies"
+
+    id = Column(BigInteger, response_body_seq, primary_key=True, server_default=response_body_seq.next_value())
+    api_log_id = Column(BigInteger, ForeignKey("api_logs.id", ondelete="CASCADE"), nullable=False)
+    body = Column(Text, nullable=True)
+
+class User(Base):
+    __tablename__ = "users"
+    id = Column(BigInteger, user_seq, primary_key=True, server_default=user_seq.next_value())
+    username = Column(String(50), nullable=False)
+Changes:
+	•	Added request_id as BINARY(16) (maps to Oracle RAW(16)), correlation_id as String(36), and track_id as String(50).
+4. `api_tracker/logging_strategies.py`
+Update to include new IDs and handle exceptions internally if needed.
+from abc import ABC, abstractmethod
+from sqlalchemy.orm import Session
+from .models import APILog, RequestBody, ResponseBody
+from .config import settings
+import json
+from datetime import datetime
+import time
+import logging
+
+logger = logging.getLogger(__name__)
+
+class LoggingStrategy(ABC):
+    @abstractmethod
+    def log_request(self, log_data: dict, db: Session = None) -> int:
+        pass
+
+    @abstractmethod
+    def log_response(self, log_id: int, response_data: dict, db: Session = None):
+        pass
+
+class DatabaseLoggingStrategy(LoggingStrategy):
+    def __init__(self, db: Session):
+        self.db = db
+
+    def log_request(self, log_data: dict, db: Session = None) -> int:
+        try:
+            log_entry = APILog(
+                request_id=bytes.fromhex(log_data["request_id"].replace("-", "")),
+                correlation_id=log_data["correlation_id"],
+                track_id=log_data["track_id"],
+                request_method=log_data["request_method"],
+                request_url=log_data["request_url"],
+                request_headers=log_data["request_headers"],
+                client_ip=log_data["client_ip"],
+                request_time=log_data["request_time"],
+            )
+            self.db.add(log_entry)
+            self.db.flush()
+
+            if log_data.get("request_body"):
+                request_body = RequestBody(api_log_id=log_entry.id, body=log_data["request_body"])
+                self.db.add(request_body)
+
+            self.db.commit()
+            return log_entry.id
+        except Exception as e:
+            logger.error(f"Database logging failed for request: {str(e)}", exc_info=True)
+            self.db.rollback()
+            raise  # Re-raise to be caught by middleware
+
+    def log_response(self, log_id: int, response_data: dict, db: Session = None):
+        try:
+            log_entry = self.db.query(APILog).filter(APILog.id == log_id).first()
+            if log_entry:
+                for key, value in response_data.items():
+                    if key != "response_body":
+                        setattr(log_entry, key, value)
+
+                if response_data.get("response_body"):
+                    response_body = ResponseBody(api_log_id=log_id, body=response_data["response_body"])
+                    self.db.add(response_body)
+
+                self.db.commit()
+        except Exception as e:
+            logger.error(f"Database logging failed for response: {str(e)}", exc_info=True)
+            self.db.rollback()
+            raise
+
+class FileLoggingStrategy(LoggingStrategy):
+    def log_request(self, log_data: dict, db: Session = None) -> int:
+        try:
+            log_id = int(time.time() * 1000)
+            log_data["id"] = log_id
+            with open(settings.LOG_FILE_PATH, "a") as f:
+                log_data["request_time"] = log_data["request_time"].isoformat()
+                f.write(json.dumps(log_data) + "\n")
+            return log_id
+        except Exception as e:
+            logger.error(f"File logging failed for request: {str(e)}", exc_info=True)
+            raise
+
+    def log_response(self, log_id: int, response_data: dict, db: Session = None):
+        try:
+            log_data = {"id": log_id, **response_data}
+            with open(settings.LOG_FILE_PATH, "a") as f:
+                if log_data.get("response_time"):
+                    log_data["response_time"] = log_data["response_time"].isoformat()
+                f.write(json.dumps(log_data) + "\n")
+        except Exception as e:
+            logger.error(f"File logging failed for response: {str(e)}", exc_info=True)
+            raise
+
+class LoggingContext:
+    def __init__(self, db: Session = None):
+        self.strategies = []
+        self.db = db
+        for strategy in settings.LOGGING_STRATEGIES:
+            if strategy.strip().lower() == "db" and db:
+                self.strategies.append(DatabaseLoggingStrategy(db))
+            elif strategy.strip().lower() == "file":
+                self.strategies.append(FileLoggingStrategy())
+
+    def log_request(self, log_data: dict) -> list[int]:
+        log_ids = []
+        for strategy in self.strategies:
+            try:
+                log_id = strategy.log_request(log_data, self.db)
+                log_ids.append(log_id)
+            except Exception:
+                continue  # Skip failed strategy, proceed with others
+        return log_ids
+
+    def log_response(self, log_ids: list[int], response_data: dict):
+        for strategy, log_id in zip(self.strategies, log_ids):
+            try:
+                strategy.log_response(log_id, response_data, self.db)
+            except Exception:
+                continue  # Skip failed strategy
+Changes:
+	•	Added request_id, correlation_id, and track_id to log_data and APILog.
+	•	Converted UUID request_id to bytes for RAW(16) storage.
+	•	Added exception handling in strategies, re-raising to be caught by the middleware, with LoggingContext skipping failed strategies.
+5. `api_tracker/config.py`
+Update to include sensitive header fields.
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+
+class Settings:
+    DATABASE_URL = os.getenv("DATABASE_URL", "oracle+oracledb://username:password@localhost:1521/ORCLPDB1")
+    LOG_FILE_PATH = os.getenv("LOG_FILE_PATH", "api_logs.log")
+    SENSITIVE_FIELDS = os.getenv("SENSITIVE_FIELDS", "password,token,secret,Authorization,X-API-Key").split(",")
+    LOGGING_STRATEGIES = os.getenv("LOGGING_STRATEGIES", "db").split(",")
+    EXCLUDED_PATHS = os.getenv("EXCLUDED_PATHS", "").split(",")
+
+settings = Settings()
+Changes:
+	•	Added Authorization and X-API-Key to default SENSITIVE_FIELDS.
+6. Updated Tests (`tests/test_main.py`)
+Add tests for new IDs and exception handling.
+import pytest
+import pytest_asyncio
+from fastapi import FastAPI
+from httpx import AsyncClient
+from api_tracker.main import add_api_logging_middleware
+from api_tracker.database import get_db
+from unittest.mock import Mock, patch
+from datetime import datetime, timezone
+
+app = FastAPI()
+add_api_logging_middleware(app)
+
+async def mock_get_db():
+    db = Mock()
+    yield db
+
+app.dependency_overrides[get_db] = mock_get_db
+
+@pytest_asyncio.fixture
+async def client():
+    async with AsyncClient(app=app, base_url="http://test") as client:
+        yield client
+
+@pytest.mark.asyncio
+async def test_logging_middleware_success_with_ids(client, monkeypatch):
+    monkeypatch.setattr("api_tracker.config.settings.EXCLUDED_PATHS", ["/other"])
+    monkeypatch.setattr("api_tracker.config.settings.LOGGING_STRATEGIES", ["db"])
+    async def test_endpoint():
+        return {"message": "Test", "password": "secret"}
+    app.get("/test")(test_endpoint)
+    with patch("api_tracker.logging_strategies.LoggingContext.log_request") as mock_log_request, \
+         patch("api_tracker.logging_strategies.LoggingContext.log_response") as mock_log_response:
+        headers = {"X-Correlation-ID": "corr-123", "X-Track-ID": "track-456"}
+        response = await client.get("/test", headers=headers)
+        assert response.status_code == 200
+        assert "X-Request-ID" in response.headers
+        log_data = mock_log_request.call_args[0][0]
+        assert len(log_data["request_id"]) == 36  # UUID length
+        assert log_data["correlation_id"] == "corr-123"
+        assert log_data["track_id"] == "track-456"
+        assert log_data["request_headers"] == '{"X-Correlation-ID": "corr-123", "X-Track-ID": "track-456"}'
+        response_data = mock_log_response.call_args[0][1]
+        assert response_data["response_body"] == '{"message": "Test", "password": "****"}'
+
+@pytest.mark.asyncio
+async def test_logging_middleware_logging_failure(client, monkeypatch):
+    monkeypatch.setattr("api_tracker.config.settings.EXCLUDED_PATHS", ["/other"])
+    async def test_endpoint():
+        return {"message": "Test"}
+    app.get("/test")(test_endpoint)
+    with patch("api_tracker.logging_strategies.LoggingContext.log_request", side_effect=Exception("DB Error")), \
+         patch("api_tracker.logging_strategies.LoggingContext.log_response") as mock_log_response:
+        response = await client.get("/test")
+        assert response.status_code == 200  # Request succeeds despite logging failure
+        assert "X-Request-ID" in response.headers
+        assert not mock_log_response.called  # No response logging if request logging fails
+Changes:
+	•	Added test for request_id, correlation_id, and track_id.
+	•	Tested logging failure scenario to ensure request processing continues.
+7. Rerunnable DDL (Unchanged from Previous Request)
+The DDL already includes request_id, correlation_id, and track_id as requested earlier:
+-- [Same as previous DDL, repeated for completeness]
+-- Drop sequences if they exist
+BEGIN
+   EXECUTE IMMEDIATE 'DROP SEQUENCE api_log_id_seq';
+EXCEPTION
+   WHEN OTHERS THEN
+      IF SQLCODE != -2289 THEN RAISE; END IF;
+END;
+/
+
+BEGIN
+   EXECUTE IMMEDIATE 'DROP SEQUENCE request_body_id_seq';
+EXCEPTION
+   WHEN OTHERS THEN
+      IF SQLCODE != -2289 THEN RAISE; END IF;
+END;
+/
+
+BEGIN
+   EXECUTE IMMEDIATE 'DROP SEQUENCE response_body_id_seq';
+EXCEPTION
+   WHEN OTHERS THEN
+      IF SQLCODE != -2289 THEN RAISE; END IF;
+END;
+/
+
+BEGIN
+   EXECUTE IMMEDIATE 'DROP SEQUENCE user_id_seq';
+EXCEPTION
+   WHEN OTHERS THEN
+      IF SQLCODE != -2289 THEN RAISE; END IF;
+END;
+/
+
+-- Drop tables if they exist
+BEGIN
+   EXECUTE IMMEDIATE 'DROP TABLE request_bodies CASCADE CONSTRAINTS';
+EXCEPTION
+   WHEN OTHERS THEN
+      IF SQLCODE != -942 THEN RAISE; END IF;
+END;
+/
+
+BEGIN
+   EXECUTE IMMEDIATE 'DROP TABLE response_bodies CASCADE CONSTRAINTS';
+EXCEPTION
+   WHEN OTHERS THEN
+      IF SQLCODE != -942 THEN RAISE; END IF;
+END;
+/
+
+BEGIN
+   EXECUTE IMMEDIATE 'DROP TABLE api_logs CASCADE CONSTRAINTS';
+EXCEPTION
+   WHEN OTHERS THEN
+      IF SQLCODE != -942 THEN RAISE; END IF;
+END;
+/
+
+BEGIN
+   EXECUTE IMMEDIATE 'DROP TABLE users CASCADE CONSTRAINTS';
+EXCEPTION
+   WHEN OTHERS THEN
+      IF SQLCODE != -942 THEN RAISE; END IF;
+END;
+/
+
+-- Create sequences
+CREATE SEQUENCE api_log_id_seq START WITH 1 INCREMENT BY 1 NOCACHE NOCYCLE;
+CREATE SEQUENCE request_body_id Vaughseq START WITH 1 INCREMENT BY 1 NOCACHE NOCYCLE;
+CREATE SEQUENCE response_body_id_seq START WITH 1 INCREMENT BY 1 NOCACHE NOCYCLE;
+CREATE SEQUENCE user_id_seq START WITH 1 INCREMENT BY 1 NOCACHE NOCYCLE;
+
+-- Create tables
+CREATE TABLE users (
+   id NUMBER(19,0) DEFAULT user_id_seq.NEXTVAL,
+   username VARCHAR2(50) NOT NULL,
+   CONSTRAINT pk_users PRIMARY KEY (id)
+);
+
+COMMENT ON TABLE users IS 'Stores authenticated user information for linking to API logs.';
+COMMENT ON COLUMN users.id IS 'Unique identifier for each user, auto-incremented.';
+COMMENT ON COLUMN users.username IS 'Username of the authenticated user, required.';
+
+CREATE TABLE api_logs (
+   id NUMBER(19,0) DEFAULT api_log_id_seq.NEXTVAL,
+   request_id RAW(16) NOT NULL,
+   correlation_id VARCHAR2(36),
+   track_id VARCHAR2(50),
+   request_method VARCHAR2(10) NOT NULL,
+   request_url VARCHAR2(255) NOT NULL,
+   request_headers CLOB,
+   response_status NUMBER(10,0),
+   response_headers CLOB,
+   client_ip VARCHAR2(45) NOT NULL,
+   request_time DATE DEFAULT SYSDATE NOT NULL,
+   response_time DATE,
+   execution_time_ms NUMBER(10,0),
+   user_id NUMBER(19,0),
+   error_message CLOB,
+   CONSTRAINT pk_api_logs PRIMARY KEY (id),
+   CONSTRAINT fk_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL,
+   CONSTRAINT uk_request_id UNIQUE (request_id)
+);
+
+COMMENT ON TABLE api_logs IS 'Stores metadata for API requests and responses.';
+COMMENT ON COLUMN api_logs.request_id IS 'Server-generated UUID for each request, unique.';
+COMMENT ON COLUMN api_logs.correlation_id IS 'Client-provided UUID or string to correlate requests.';
+COMMENT ON COLUMN api_logs.track_id IS 'Custom tracking ID for internal request tracking.';
+
+CREATE TABLE request_bodies (
+   id NUMBER(19,0) DEFAULT request_body_id_seq.NEXTVAL,
+   api_log_id NUMBER(19,0) NOT NULL,
+   body CLOB,
+   CONSTRAINT pk_request_bodies PRIMARY KEY (id),
+   CONSTRAINT fk_api_log_request FOREIGN KEY (api_log_id) REFERENCES api_logs(id) ON DELETE CASCADE
+);
+
+COMMENT ON TABLE request_bodies IS 'Stores request payloads linked to api_logs.';
+COMMENT ON COLUMN request_bodies.id IS 'Unique identifier for each request body, auto-incremented.';
+COMMENT ON COLUMN request_bodies.api_log_id IS 'Foreign key linking to api_logs, required.';
+COMMENT ON COLUMN request_bodies.body IS 'Request payload (e.g., JSON), optional.';
+
+CREATE TABLE response_bodies (
+   id NUMBER(19,0) DEFAULT response_body_id_seq.NEXTVAL,
+   api_log_id NUMBER(19,0) NOT NULL,
+   body CLOB,
+   CONSTRAINT pk_response_bodies PRIMARY KEY (id),
+   CONSTRAINT fk_api_log_response FOREIGN KEY (api_log_id) REFERENCES api_logs(id) ON DELETE CASCADE
+);
+
+COMMENT ON TABLE response_bodies IS 'Stores response payloads linked to api_logs.';
+COMMENT ON COLUMN response_bodies.id IS 'Unique identifier for each response body, auto-incremented.';
+COMMENT ON COLUMN response_bodies.api_log_id IS 'Foreign key linking to api_logs, required.';
+COMMENT ON COLUMN response_bodies.body IS 'Response payload (e.g., JSON), optional.';
+
+Notes
+	•	Sanitization: Now applies to request_headers and response_headers, masking fields like Authorization. Update .env with SENSITIVE_FIELDS=password,token,secret,Authorization,X-API-Key to test.
+	•	Exception Handling: Logging failures are caught and logged to the console/file via logging.error, ensuring the API remains functional. The LoggingContext skips failed strategies, allowing partial logging if one method (e.g., DB) fails but another (e.g., file) succeeds.
+	•	UUID Handling: request_id is stored as RAW(16) (16 bytes for UUID), converted from a string to bytes in DatabaseLoggingStrategy.
+This updated design ensures robust logging with traceability (via IDs) and resilience (via exception handling). Let me know if you need further refinements or additional test cases!
