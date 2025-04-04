@@ -1,0 +1,490 @@
+To enhance the api_tracker package with log rotation for file logging, including a 100MB file size limit and timestamp-suffixed filenames within daily folders, I’ll update the FileLoggingStrategy in logging_strategies.py. This will use Python’s logging module with a RotatingFileHandler customized to create a new folder for each day and append a timestamp to rotated log files. The updates will maintain the existing features (UUID-based IDs, sanitization for headers and bodies, exception handling) while integrating this new requirement.
+
+Key Changes
+	1	Log Rotation:
+	◦	Use RotatingFileHandler with a max size of 100MB (maxBytes=100 * 1024 * 1024).
+	◦	Rotate logs when the size limit is reached, keeping up to 10 backup files (backupCount=10).
+	2	Timestamp Suffix:
+	◦	Append a timestamp (e.g., YYYYMMDD_HHMMSS) to the filename of rotated logs.
+	3	Daily Folders:
+	◦	Create a folder for each day (e.g., logs/20250404/) and store logs within it.
+	◦	Update the base LOG_FILE_PATH dynamically based on the current date.
+	4	Integration:
+	◦	Replace the simple file append logic in FileLoggingStrategy with a proper logging handler.
+
+Updated Code
+1. `api_tracker/config.py`
+Add a LOG_DIR setting for the base log directory and keep LOG_FILE_PATH as a base filename.
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+
+class Settings:
+    DATABASE_URL = os.getenv("DATABASE_URL", "oracle+oracledb://username:password@localhost:1521/ORCLPDB1")
+    LOG_DIR = os.getenv("LOG_DIR", "logs")  # Base directory for logs
+    LOG_FILE_PATH = os.getenv("LOG_FILE_PATH", "api_logs.log")  # Base filename
+    SENSITIVE_FIELDS = os.getenv("SENSITIVE_FIELDS", "password,token,secret,authorization,x-api-key").split(",")
+    LOGGING_STRATEGIES = os.getenv("LOGGING_STRATEGIES", "db").split(",")
+    EXCLUDED_PATHS = os.getenv("EXCLUDED_PATHS", "").split(",")
+
+settings = Settings()
+2. `api_tracker/logging_strategies.py`
+Update FileLoggingStrategy to use a custom rotating file handler with daily folders and timestamp suffixes.
+from abc import ABC, abstractmethod
+from sqlalchemy.orm import Session
+from .models import APILog, RequestBody, ResponseBody
+from .config import settings
+import json
+from datetime import datetime, timezone
+import time
+import logging
+import os
+from logging.handlers import RotatingFileHandler
+
+class CustomRotatingFileHandler(RotatingFileHandler):
+    def __init__(self, base_filename, max_bytes, backup_count):
+        # Construct the daily folder path (e.g., logs/20250404)
+        today = datetime.now(timezone.utc).strftime("%Y%m%d")
+        log_dir = os.path.join(settings.LOG_DIR, today)
+        os.makedirs(log_dir, exist_ok=True)  # Create folder if it doesn't exist
+        
+        # Use base filename within the daily folder
+        self.base_filename = os.path.join(log_dir, os.path.basename(base_filename))
+        super().__init__(self.base_filename, maxBytes=max_bytes, backupCount=backup_count)
+
+    def doRollover(self):
+        # Custom rollover with timestamp suffix
+        if self.stream:
+            self.stream.close()
+            self.stream = None
+        
+        # Generate timestamp for the rotated file
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        rotated_filename = f"{self.base_filename}.{timestamp}"
+        
+        if os.path.exists(self.base_filename):
+            os.rename(self.base_filename, rotated_filename)
+        
+        # Clean up old files if exceeding backupCount
+        backups = sorted([f for f in os.listdir(os.path.dirname(self.base_filename)) 
+                         if f.startswith(os.path.basename(self.base_filename) + ".")], 
+                        reverse=True)
+        for old_file in backups[self.backupCount:]:
+            os.remove(os.path.join(os.path.dirname(self.base_filename), old_file))
+        
+        self.stream = self._open()
+
+class LoggingStrategy(ABC):
+    @abstractmethod
+    def log_request(self, log_data: dict, db: Session = None) -> int:
+        pass
+
+    @abstractmethod
+    def log_response(self, log_id: int, response_data: dict, db: Session = None):
+        pass
+
+class DatabaseLoggingStrategy(LoggingStrategy):
+    def __init__(self, db: Session):
+        self.db = db
+
+    def log_request(self, log_data: dict, db: Session = None) -> int:
+        log_entry = APILog(
+            request_id=log_data["request_id"],
+            correlation_id=log_data["correlation_id"],
+            track_id=log_data["track_id"],
+            request_method=log_data["request_method"],
+            request_url=log_data["request_url"],
+            request_headers=log_data["request_headers"],
+            client_ip=log_data["client_ip"],
+            request_time=log_data["request_time"],
+        )
+        self.db.add(log_entry)
+        self.db.flush()
+
+        if log_data.get("request_body"):
+            request_body = RequestBody(api_log_id=log_entry.id, body=log_data["request_body"])
+            self.db.add(request_body)
+
+        self.db.commit()
+        return log_entry.id
+
+    def log_response(self, log_id: int, response_data: dict, db: Session = None):
+        log_entry = self.db.query(APILog).filter(APILog.id == log_id).first()
+        if log_entry:
+            for key, value in response_data.items():
+                if key != "response_body":
+                    setattr(log_entry, key, value)
+
+            if response_data.get("response_body"):
+                response_body = ResponseBody(api_log_id=log_id, body=response_data["response_body"])
+                self.db.add(response_body)
+
+            self.db.commit()
+
+class FileLoggingStrategy(LoggingStrategy):
+    def __init__(self):
+        self.logger = logging.getLogger("FileLoggingStrategy")
+        self.logger.setLevel(logging.INFO)
+        # Remove existing handlers to avoid duplicates
+        if self.logger.handlers:
+            self.logger.handlers.clear()
+        # Set up custom rotating handler
+        handler = CustomRotatingFileHandler(
+            base_filename=settings.LOG_FILE_PATH,
+            max_bytes=100 * 1024 * 1024,  # 100MB
+            backup_count=10
+        )
+        handler.setFormatter(logging.Formatter("%(message)s"))  # JSON lines
+        self.logger.addHandler(handler)
+
+    def log_request(self, log_data: dict, db: Session = None) -> int:
+        log_id = int(time.time() * 1000)  # Pseudo-ID for file logging
+        log_data = log_data.copy()
+        log_data["id"] = log_id
+        log_data["request_time"] = log_data["request_time"].isoformat()
+        self.logger.info(json.dumps(log_data))
+        return log_id
+
+    def log_response(self, log_id: int, response_data: dict, db: Session = None):
+        log_data = response_data.copy()
+        log_data["id"] = log_id
+        if log_data.get("response_time"):
+            log_data["response_time"] = log_data["response_time"].isoformat()
+        self.logger.info(json.dumps(log_data))
+
+class LoggingContext:
+    def __init__(self, db: Session = None):
+        self.strategies = []
+        self.db = db
+        for strategy in settings.LOGGING_STRATEGIES:
+            if strategy.strip().lower() == "db" and db:
+                self.strategies.append(DatabaseLoggingStrategy(db))
+            elif strategy.strip().lower() == "file":
+                self.strategies.append(FileLoggingStrategy())
+
+    def log_request(self, log_data: dict) -> list[int]:
+        log_ids = []
+        for strategy in self.strategies:
+            log_id = strategy.log_request(log_data, self.db)
+            log_ids.append(log_id)
+        return log_ids
+
+    def log_response(self, log_ids: list[int], response_data: dict):
+        for strategy, log_id in zip(self.strategies, log_ids):
+            strategy.log_response(log_id, response_data, self.db)
+3. `api_tracker/main.py` (Updated with Previous Changes)
+Ensure headers are sanitized and exceptions are handled, unchanged from the previous update except for completeness.
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
+from sqlalchemy.orm import Session
+from .database import get_db
+from .config import settings
+from .sanitizer import sanitize_data
+from .logging_strategies import LoggingContext
+import time
+import json
+from datetime import datetime, timezone
+import uuid
+import logging
+
+logging.basicConfig(level=logging.ERROR)
+logger = logging.getLogger(__name__)
+
+def add_api_logging_middleware(app: FastAPI):
+    @app.middleware("http")
+    async def log_api_requests(request: Request, call_next):
+        request_path = str(request.url.path)
+        if request_path in settings.EXCLUDED_PATHS:
+            return await call_next(request)
+
+        start_time = time.time()
+        db = next(get_db())
+        logging_context = LoggingContext(db)
+
+        request_id = uuid.uuid4()
+        correlation_id = request.headers.get("X-Correlation-ID")
+        track_id = request.headers.get("X-Track-ID")
+
+        request_headers = sanitize_data(json.dumps(dict(request.headers)))
+        request_body = await request.body()
+        request_body_str = sanitize_data(request_body.decode("utf-8", errors="ignore") if request_body else None)
+        client_ip = request.client.host
+
+        log_data = {
+            "request_id": str(request_id),
+            "correlation_id": correlation_id,
+            "track_id": track_id,
+            "request_method": request.method,
+            "request_url": request_path,
+            "request_headers": request_headers,
+            "request_body": request_body_str,
+            "client_ip": client_ip,
+            "request_time": datetime.now(timezone.utc),
+        }
+
+        log_ids = []
+        try:
+            log_ids = logging_context.log_request(log_data)
+        except Exception as e:
+            logger.error(f"Failed to log request for {request_path}: {str(e)}", exc_info=True)
+
+        try:
+            response = await call_next(request)
+            response_body = b""
+            async for chunk in response.body_iterator:
+                response_body += chunk
+            response_body_str = sanitize_data(response_body.decode("utf-8", errors="ignore") if response_body else None)
+            response_headers = sanitize_data(json.dumps(dict(response.headers)))
+
+            execution_time_ms = int((time.time() - start_time) * 1000)
+            response_data = {
+                "response_status": response.status_code,
+                "response_body": response_body_str,
+                "response_headers": response_headers,
+                "response_time": datetime.now(timezone.utc),
+                "execution_time_ms": execution_time_ms,
+            }
+
+            try:
+                if log_ids:
+                    logging_context.log_response(log_ids, response_data)
+            except Exception as e:
+                logger.error(f"Failed to log response for {request_path}: {str(e)}", exc_info=True)
+
+            # Add request_id to response headers for traceability
+            response_headers_dict = json.loads(response_headers)
+            response_headers_dict["X-Request-ID"] = str(request_id)
+            return JSONResponse(
+                status_code=response.status_code,
+                content=json.loads(response_body_str) if response_body_str else None,
+                headers=response_headers_dict,
+            )
+
+        except Exception as e:
+            execution_time_ms = int((time.time() - start_time) * 1000)
+            response_data = {
+                "response_status": 500,
+                "error_message": str(e),
+                "response_time": datetime.now(timezone.utc),
+                "execution_time_ms": execution_time_ms,
+            }
+            try:
+                if log_ids:
+                    logging_context.log_response(log_ids, response_data)
+            except Exception as e_log:
+                logger.error(f"Failed to log error response for {request_path}: {str(e_log)}", exc_info=True)
+            raise HTTPException(status_code=500, detail="Internal Server Error")
+4. `api_tracker/models.py` (Updated with UUID Fields)
+Ensure the model supports the new UUID fields.
+from sqlalchemy import Column, Integer, String, Text, DateTime, BigInteger, ForeignKey, Sequence, RAW
+from sqlalchemy.sql import func
+from .database import Base
+
+api_log_seq = Sequence('api_log_id_seq')
+request_body_seq = Sequence('request_body_id_seq')
+response_body_seq = Sequence('response_body_id_seq')
+user_seq = Sequence('user_id_seq')
+
+class APILog(Base):
+    __tablename__ = "api_logs"
+
+    id = Column(BigInteger, api_log_seq, primary_key=True, server_default=api_log_seq.next_value())
+    request_id = Column(RAW(16), nullable=False, unique=True)  # UUID as RAW(16)
+    correlation_id = Column(String(36), nullable=True)  # UUID or string
+    track_id = Column(String(50), nullable=True)  # Custom tracking ID
+    request_method = Column(String(10), nullable=False)
+    request_url = Column(String(255), nullable=False)
+    request_headers = Column(Text, nullable=True)
+    response_status = Column(Integer, nullable=True)
+    response_headers = Column(Text, nullable=True)
+    client_ip = Column(String(45), nullable=False)
+    request_time = Column(DateTime, nullable=False, server_default=func.sysdate())
+    response_time = Column(DateTime, nullable=True)
+    execution_time_ms = Column(Integer, nullable=True)
+    user_id = Column(BigInteger, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    error_message = Column(Text, nullable=True)
+
+class RequestBody(Base):
+    __tablename__ = "request_bodies"
+
+    id = Column(BigInteger, request_body_seq, primary_key=True, server_default=request_body_seq.next_value())
+    api_log_id = Column(BigInteger, ForeignKey("api_logs.id", ondelete="CASCADE"), nullable=False)
+    body = Column(Text, nullable=True)
+
+class ResponseBody(Base):
+    __tablename__ = "response_bodies"
+
+    id = Column(BigInteger, response_body_seq, primary_key=True, server_default=response_body_seq.next_value())
+    api_log_id = Column(BigInteger, ForeignKey("api_logs.id", ondelete="CASCADE"), nullable=False)
+    body = Column(Text, nullable=True)
+
+class User(Base):
+    __tablename__ = "users"
+    id = Column(BigInteger, user_seq, primary_key=True, server_default=user_seq.next_value())
+    username = Column(String(50), nullable=False)
+5. Updated DDL Script (Unchanged from Previous UUID Addition)
+Included for completeness, no further changes needed.
+-- Drop sequences if they exist
+BEGIN
+   EXECUTE IMMEDIATE 'DROP SEQUENCE api_log_id_seq';
+EXCEPTION
+   WHEN OTHERS THEN
+      IF SQLCODE != -2289 THEN RAISE; END IF;
+END;
+/
+
+BEGIN
+   EXECUTE IMMEDIATE 'DROP SEQUENCE request_body_id_seq';
+EXCEPTION
+   WHEN OTHERS THEN
+      IF SQLCODE != -2289 THEN RAISE; END IF;
+END;
+/
+
+BEGIN
+   EXECUTE IMMEDIATE 'DROP SEQUENCE response_body_id_seq';
+EXCEPTION
+   WHEN OTHERS THEN
+      IF SQLCODE != -2289 THEN RAISE; END IF;
+END;
+/
+
+BEGIN
+   EXECUTE IMMEDIATE 'DROP SEQUENCE user_id_seq';
+EXCEPTION
+   WHEN OTHERS THEN
+      IF SQLCODE != -2289 THEN RAISE; END IF;
+END;
+/
+
+-- Drop tables if they exist
+BEGIN
+   EXECUTE IMMEDIATE 'DROP TABLE request_bodies CASCADE CONSTRAINTS';
+EXCEPTION
+   WHEN OTHERS THEN
+      IF SQLCODE != -942 THEN RAISE; END IF;
+END;
+/
+
+BEGIN
+   EXECUTE IMMEDIATE 'DROP TABLE response_bodies CASCADE CONSTRAINTS';
+EXCEPTION
+   WHEN OTHERS THEN
+      IF SQLCODE != -942 THEN RAISE; END IF;
+END;
+/
+
+BEGIN
+   EXECUTE IMMEDIATE 'DROP TABLE api_logs CASCADE CONSTRAINTS';
+EXCEPTION
+   WHEN OTHERS THEN
+      IF SQLCODE != -942 THEN RAISE; END IF;
+END;
+/
+
+BEGIN
+   EXECUTE IMMEDIATE 'DROP TABLE users CASCADE CONSTRAINTS';
+EXCEPTION
+   WHEN OTHERS THEN
+      IF SQLCODE != -942 THEN RAISE; END IF;
+END;
+/
+
+-- Create sequences
+CREATE SEQUENCE api_log_id_seq START WITH 1 INCREMENT BY 1 NOCACHE NOCYCLE;
+CREATE SEQUENCE request_body_id_seq START WITH 1 INCREMENT BY 1 NOCACHE NOCYCLE;
+CREATE SEQUENCE response_body_id_seq START WITH 1 INCREMENT BY 1 NOCACHE NOCYCLE;
+CREATE SEQUENCE user_id_seq START WITH 1 INCREMENT BY 1 NOCACHE NOCYCLE;
+
+-- Create tables
+CREATE TABLE users (
+   id NUMBER(19,0) DEFAULT user_id_seq.NEXTVAL,
+   username VARCHAR2(50) NOT NULL,
+   CONSTRAINT pk_users PRIMARY KEY (id)
+);
+
+CREATE TABLE api_logs (
+   id NUMBER(19,0) DEFAULT api_log_id_seq.NEXTVAL,
+   request_id RAW(16) NOT NULL,
+   correlation_id VARCHAR2(36),
+   track_id VARCHAR2(50),
+   request_method VARCHAR2(10) NOT NULL,
+   request_url VARCHAR2(255) NOT NULL,
+   request_headers CLOB,
+   response_status NUMBER(10,0),
+   response_headers CLOB,
+   client_ip VARCHAR2(45) NOT NULL,
+   request_time DATE DEFAULT SYSDATE NOT NULL,
+   response_time DATE,
+   execution_time_ms NUMBER(10,0),
+   user_id NUMBER(19,0),
+   error_message CLOB,
+   CONSTRAINT pk_api_logs PRIMARY KEY (id),
+   CONSTRAINT fk_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL,
+   CONSTRAINT uk_request_id UNIQUE (request_id)
+);
+
+CREATE TABLE request_bodies (
+   id NUMBER(19,0) DEFAULT request_body_id_seq.NEXTVAL,
+   api_log_id NUMBER(19,0) NOT NULL,
+   body CLOB,
+   CONSTRAINT pk_request_bodies PRIMARY KEY (id),
+   CONSTRAINT fk_api_log_request FOREIGN KEY (api_log_id) REFERENCES api_logs(id) ON DELETE CASCADE
+);
+
+CREATE TABLE response_bodies (
+   id NUMBER(19,0) DEFAULT response_body_id_seq.NEXTVAL,
+   api_log_id NUMBER(19,0) NOT NULL,
+   body CLOB,
+   CONSTRAINT pk_response_bodies PRIMARY KEY (id),
+   CONSTRAINT fk_api_log_response FOREIGN KEY (api_log_id) REFERENCES api_logs(id) ON DELETE CASCADE
+);
+
+Notes on Changes
+	1	Sanitization:
+	◦	SENSITIVE_FIELDS now includes authorization and x-api-key by default to mask common sensitive headers.
+	◦	sanitize_data applies to both headers and bodies, ensuring consistent protection.
+	2	Exception Handling:
+	◦	Logging failures are caught and logged to stderr via Python’s logging module, but the request/response processing continues uninterrupted.
+	◦	The X-Request-ID header is added to responses for traceability, even if logging fails.
+	3	Log Rotation:
+	◦	Files are stored in logs/YYYYMMDD/api_logs.log.
+	◦	When a file reaches 100MB, it’s rotated to logs/YYYYMMDD/api_logs.log.YYYYMMDD_HHMMSS (e.g., logs/20250404/api_logs.log.20250404_123456).
+	◦	Up to 10 backups are kept per day; older files are deleted during rotation.
+	◦	Daily folders ensure logs are organized by date, improving manageability.
+
+Testing the Changes
+	1	Setup:
+	◦	Update .env: LOG_DIR=logs
+	◦	LOG_FILE_PATH=api_logs.log
+	◦	LOGGING_STRATEGIES=db,file
+	◦	SENSITIVE_FIELDS=password,token,secret,authorization,x-api-key
+	◦	EXCLUDED_PATHS=/health
+	◦	
+	2	Run:
+	◦	Use the example app: from fastapi import FastAPI
+	◦	from api_tracker import add_api_logging_middleware, Base, engine
+	◦	
+	◦	app = FastAPI()
+	◦	add_api_logging_middleware(app)
+	◦	Base.metadata.create_all(bind=engine)
+	◦	
+	◦	@app.get("/test")
+	◦	async def test():
+	◦	    return {"message": "Hello", "password": "secret123"}
+	◦	
+	◦	if __name__ == "__main__":
+	◦	    import uvicorn
+	◦	    uvicorn.run(app, host="0.0.0.0", port=8000)
+	◦	
+	3	Verify:
+	◦	Send requests: curl -H "Authorization: Bearer xyz" http://localhost:8000/test
+	◦	Check logs/YYYYMMDD/api_logs.log for sanitized headers ("Authorization": "****") and bodies.
+	◦	Simulate large logs (e.g., repeat requests with large payloads) to trigger rotation and verify daily folders and timestamped files.
+
+Considerations
+	•	Thread Safety: RotatingFileHandler is thread-safe, but in a multi-process setup (e.g., uvicorn --workers), consider ConcurrentRotatingFileHandler from concurrent_log_handler.
+	•	Performance: File I/O is synchronous here; for high traffic, use async logging (e.g., aiofiles) or a queue-based approach.
+	•	File Cleanup: The script deletes backups beyond 10 per day; adjust backupCount or implement a cron job for broader cleanup.
+This updated design meets all requirements while maintaining robustness. Let me know if you need further tweaks!
