@@ -125,16 +125,15 @@ def add_api_logging_middleware(app: FastAPI):
 
 
 
-class BufferedRequest(Request):
-    """Custom request class to buffer the body for reuse."""
-    def __init__(self, scope: dict, receive: Receive, body: bytes):
-        super().__init__(scope, receive)
-        self._body = body
-        self._receive = receive
+   auth_header = request.headers.get("authorization")
+    user_id = None
 
-    async def body(self) -> bytes:
-        if self._body is not None:
-            return self._body
-        return await super().body()
-
-buffered_request = BufferedRequest(request.scope, request.receive, request_body)
+    if auth_header and auth_header.startswith("Bearer "):
+        token = auth_header[7:]  # remove 'Bearer '
+        try:
+            payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+            user_id = payload.get("user_id")  # Adjust based on your token structure
+            # You can store this in request.state for downstream access
+            request.state.user_id = user_id
+        except JWTError:
+            print("Invalid or expired JWT")
