@@ -125,3 +125,16 @@ def add_api_logging_middleware(app: FastAPI):
 
 
 
+class BufferedRequest(Request):
+    """Custom request class to buffer the body for reuse."""
+    def __init__(self, scope: dict, receive: Receive, body: bytes):
+        super().__init__(scope, receive)
+        self._body = body
+        self._receive = receive
+
+    async def body(self) -> bytes:
+        if self._body is not None:
+            return self._body
+        return await super().body()
+
+buffered_request = BufferedRequest(request.scope, request.receive, request_body)
