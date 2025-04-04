@@ -1,0 +1,127 @@
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse, Response
+from sqlalchemy.orm import Session
+from .database import get_db
+from .config import settings
+from .sanitizer import sanitize_data
+from .logging_strategies import LoggingContext
+import time
+import json
+from datetime import datetime, timezone
+import uuid
+import logging
+from typing import AsyncIterator
+
+logging.basicConfig(level=logging.ERROR)
+logger = logging.getLogger(__name__)
+
+async def _collect_body(body_iterator: AsyncIterator[bytes]) -> bytes:
+    """Efficiently collect response body from iterator."""
+    body = bytearray()  # Use bytearray for efficient appending
+    async for chunk in body_iterator:
+        body.extend(chunk)
+    return bytes(body)
+
+def add_api_logging_middleware(app: FastAPI):
+    @app.middleware("http")
+    async def log_api_requests(request: Request, call_next):
+        request_path = str(request.url.path)
+        if request_path in settings.EXCLUDED_PATHS:
+            return await call_next(request)
+
+        start_time = time.time()
+        db = next(get_db())
+        logging_context = LoggingContext(db)
+
+        request_id = uuid.uuid4()
+        correlation_id = request.headers.get("X-Correlation-ID")
+        track_id = request.headers.get("X-Track-ID")
+
+        request_headers = sanitize_data(json.dumps(dict(request.headers)))
+        request_body = await request.body()
+        request_body_str = sanitize_data(request_body.decode("utf-8", errors="ignore") if request_body else None)
+        client_ip = request.client.host
+
+        log_data = {
+            "request_id": str(request_id),
+            "correlation_id": correlation_id,
+            "track_id": track_id,
+            "request_method": request.method,
+            "request_url": request_path,
+            "request_headers": request_headers,
+            "request_body": request_body_str,
+            "client_ip": client_ip,
+            "request_time": datetime.now(timezone.utc),
+        }
+
+        log_ids = []
+        try:
+            log_ids = logging_context.log_request(log_data)
+        except Exception as e:
+            logger.error(f"Failed to log request for {request_path}: {str(e)}", exc_info=True)
+
+        try:
+            response = await call_next(request)
+            response_headers = sanitize_data(json.dumps(dict(response.headers)))
+            execution_time_ms = int((time.time() - start_time) * 1000)
+            
+            # Only process body for logging if EXCLUDE_RESPONSE_BODY is False
+            response_body_str = None
+            if not settings.EXCLUDE_RESPONSE_BODY:
+                response_body = await _collect_body(response.body_iterator)
+                response_body_str = sanitize_data(response_body.decode("utf-8", errors="ignore") if response_body else None)
+            
+            # Prepare response data for logging
+            response_data = {
+                "response_status": response.status_code,
+                "response_headers": response_headers,
+                "response_time": datetime.now(timezone.utc),
+                "execution_time_ms": execution_time_ms,
+            }
+            if not settings.EXCLUDE_RESPONSE_BODY and response_body_str:
+                response_data["response_body"] = response_body_str
+
+            try:
+                if log_ids:
+                    logging_context.log_response(log_ids, response_data)
+            except Exception as e:
+                logger.error(f"Failed to log response for {request_path}: {str(e)}", exc_info=True)
+
+            # Return response to client, reconstructing if body was consumed
+            response_headers_dict = json.loads(response_headers)
+            response_headers_dict["X-Request-ID"] = str(request_id)
+            if not settings.EXCLUDE_RESPONSE_BODY:
+                # Body was consumed for logging, reconstruct response
+                return JSONResponse(
+                    status_code=response.status_code,
+                    content=json.loads(response_body_str) if response_body_str else None,
+                    headers=response_headers_dict,
+                )
+            else:
+                # Body wasn’t consumed, pass through original response
+                return Response(
+                    content=response.body_iterator,  # Already an async iterator
+                    status_code=response.status_code,
+                    headers=response_headers_dict,
+                    media_type=response.media_type,
+                )
+
+        except Exception as e:
+            execution_time_ms = int((time.time() - start_time) * 1000)
+            response_data = {
+                "response_status": 500,
+                "error_message": str(e),
+                "response_time": datetime.now(timezone.utc),
+                "execution_time_ms": execution_time_ms,
+            }
+            try:
+                if log_ids:
+                    logging_context.log_response(log_ids, response_data)
+            except Exception as e_log:
+                logger.error(f"Failed to log error response for {request_path}: {str(e_log)}", exc_info=True)
+            raise HTTPException(status_code=500, detail="Internal Server Error")
+
+
+
+
+
