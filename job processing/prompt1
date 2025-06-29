@@ -1,0 +1,5 @@
+Create FASTAPI based rest service. This service will have endpoints like list, register, start, stop, status. This service internally controls long running processes. There are multiple conda environment available for the long running processes to use. The api/processes/register endpoint accepts payload and config details which include name of the conda environment and register it in internal registry. The api/{process_id}/start endpoint, start the new process with conda environment mapped and its log running process and the process itself accept request and process it. The api/{process_id}/stop endpoint, stop  gracefully if mentioned processes running and stop forcefully if flag is passed as parameter. The api/list endpoint will list out all the available registered processes and its current configuration and status.
+
+
+
+Each process itself is a long running executable module and interdependent. Each process runs in an isolated process and uses the conda environment. A single conda environment can be used by multiple processes.
