@@ -1,0 +1,127 @@
+------------------------------
+-- Tenants Table
+------------------------------
+CREATE TABLE tenants (
+    id RAW(16) DEFAULT SYS_GUID() PRIMARY KEY,
+    name VARCHAR2(255) NOT NULL UNIQUE,
+    environment_type VARCHAR2(50) NOT NULL 
+        CHECK (environment_type IN ('linux', 'openshift')),
+    config CLOB NOT NULL CHECK (config IS JSON),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT SYSTIMESTAMP NOT NULL,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT SYSTIMESTAMP NOT NULL
+);
+
+------------------------------
+-- Jobs Table
+------------------------------
+CREATE TABLE jobs (
+    id RAW(16) DEFAULT SYS_GUID() PRIMARY KEY,
+    tenant_id RAW(16) NOT NULL REFERENCES tenants(id),
+    correlation_id RAW(16) NOT NULL,
+    submitted_by VARCHAR2(255) NOT NULL,
+    status VARCHAR2(20) DEFAULT 'SUBMITTED' NOT NULL 
+        CHECK (status IN ('SUBMITTED', 'PROCESSING', 'COMPLETED', 'FAILED')),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT SYSTIMESTAMP NOT NULL
+);
+
+------------------------------
+-- Job Items Table
+------------------------------
+CREATE TABLE job_items (
+    id RAW(16) DEFAULT SYS_GUID() PRIMARY KEY,
+    job_id RAW(16) NOT NULL REFERENCES jobs(id),
+    tenant_id RAW(16) NOT NULL REFERENCES tenants(id),
+    correlation_id RAW(16) NOT NULL,
+    input_data CLOB NOT NULL CHECK (input_data IS JSON),
+    output_data CLOB CHECK (output_data IS JSON),
+    status VARCHAR2(20) DEFAULT 'PENDING' NOT NULL 
+        CHECK (status IN ('PENDING', 'PROCESSING', 'SUCCESS', 'FAILED')),
+    execution_engine_id RAW(16) REFERENCES execution_engines(id),
+    started_at TIMESTAMP WITH TIME ZONE,
+    completed_at TIMESTAMP WITH TIME ZONE
+);
+
+------------------------------
+-- Execution Engines Table
+------------------------------
+CREATE TABLE execution_engines (
+    id RAW(16) DEFAULT SYS_GUID() PRIMARY KEY,
+    tenant_id RAW(16) NOT NULL REFERENCES tenants(id),
+    instance_id VARCHAR2(255) NOT NULL,
+    status VARCHAR2(20) DEFAULT 'ACTIVE' NOT NULL 
+        CHECK (status IN ('ACTIVE', 'TERMINATING', 'FAILED')),
+    last_heartbeat TIMESTAMP WITH TIME ZONE DEFAULT SYSTIMESTAMP NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT SYSTIMESTAMP NOT NULL
+);
+
+------------------------------
+-- Workflow Audit Table
+------------------------------
+CREATE TABLE workflow_audit (
+    id NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    event_time TIMESTAMP WITH TIME ZONE DEFAULT SYSTIMESTAMP NOT NULL,
+    event_type VARCHAR2(50) NOT NULL,
+    status VARCHAR2(50) NOT NULL,
+    trace_id RAW(16) NOT NULL,
+    parent_span_id RAW(16),
+    span_id RAW(16) NOT NULL,
+    component VARCHAR2(50) NOT NULL,
+    job_id RAW(16) REFERENCES jobs(id),
+    job_item_id RAW(16) REFERENCES job_items(id),
+    engine_id RAW(16) REFERENCES execution_engines(id),
+    tenant_id RAW(16) NOT NULL REFERENCES tenants(id),
+    details CLOB NOT NULL CHECK (details IS JSON),
+    duration_ms NUMBER,
+    CONSTRAINT chk_event_type CHECK (event_type IN (
+        'JOB_SUBMITTED', 'JOB_PROCESSING_STARTED', 'JOB_PROCESSING_COMPLETED',
+        'JOB_ITEM_CREATED', 'JOB_ITEM_QUEUED', 'JOB_ITEM_PROCESSING_START',
+        'JOB_ITEM_EXECUTION_START', 'JOB_ITEM_EXECUTION_END', 
+        'JOB_ITEM_SUCCESS', 'JOB_ITEM_FAILED',
+        'ENGINE_REGISTERED', 'ENGINE_DEREGISTERED', 'ENGINE_HEARTBEAT',
+        'STATUS_CHANGE', 'ERROR_OCCURRED'
+    )),
+    CONSTRAINT chk_status CHECK (status IN (
+        'PENDING', 'RUNNING', 'SUCCESS', 'FAILED', 'TIMEOUT', 
+        'QUEUED', 'RETRYING', 'COMPLETED', 'TERMINATED'
+    )),
+    CONSTRAINT chk_component CHECK (component IN (
+        'API', 'JOB_CONSUMER', 'ENGINE_WORKER', 'SCHEDULER', 'DB'
+    ))
+);
+
+------------------------------
+-- Indexes
+------------------------------
+-- Tenants
+CREATE INDEX idx_tenants_name ON tenants(name);
+CREATE INDEX idx_tenants_env_type ON tenants(environment_type);
+
+-- Jobs
+CREATE INDEX idx_jobs_tenant ON jobs(tenant_id);
+CREATE INDEX idx_jobs_correlation ON jobs(correlation_id);
+CREATE INDEX idx_jobs_status ON jobs(status);
+CREATE INDEX idx_jobs_created ON jobs(created_at);
+
+-- Job Items
+CREATE INDEX idx_job_items_job ON job_items(job_id);
+CREATE INDEX idx_job_items_tenant ON job_items(tenant_id);
+CREATE INDEX idx_job_items_status ON job_items(status);
+CREATE INDEX idx_job_items_engine ON job_items(execution_engine_id);
+CREATE INDEX idx_job_items_correlation ON job_items(correlation_id);
+
+-- Execution Engines
+CREATE INDEX idx_engines_tenant ON execution_engines(tenant_id);
+CREATE INDEX idx_engines_instance ON execution_engines(instance_id);
+CREATE INDEX idx_engines_status ON execution_engines(status);
+CREATE INDEX idx_engines_heartbeat ON execution_engines(last_heartbeat);
+
+-- Workflow Audit
+CREATE INDEX idx_wf_audit_trace ON workflow_audit(trace_id);
+CREATE INDEX idx_wf_audit_tenant ON workflow_audit(tenant_id);
+CREATE INDEX idx_wf_audit_job ON workflow_audit(job_id);
+CREATE INDEX idx_wf_audit_job_item ON workflow_audit(job_item_id);
+CREATE INDEX idx_wf_audit_engine ON workflow_audit(engine_id);
+CREATE INDEX idx_wf_audit_event_time ON workflow_audit(event_time);
+CREATE INDEX idx_wf_audit_event_type ON workflow_audit(event_type);
+CREATE INDEX idx_wf_audit_status ON workflow_audit(status);
+CREATE INDEX idx_wf_audit_component ON workflow_audit(component);
